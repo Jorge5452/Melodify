@@ -1,0 +1,50 @@
+# Archivos de configuración
+config.py
+db_connection.py
+
+# Archivos temporales de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entorno virtual
+venv/
+env/
+ENV/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Archivos temporales de descarga
+*.mp3
+*.webp
+*.jpg
+*.part
+*.temp
+
+# Logs
+*.log
+
+# IDEs y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.bak
+
+# Archivos de base de datos
+*.db
+*.sqlite3
+
+# Archivos de ambiente
+.env
+.env.local
+.env.*.local
+
+# Otros
+node_modules/
+dist/
+build/
+*.egg-info/ 

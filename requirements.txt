@@ -1,0 +1,15 @@
+python-telegram-bot==20.6
+yt-dlp==2023.11.16
+ffmpeg-python==0.2.0
+aiofiles==23.2.1
+tenacity==8.2.2
+
+
+- Arreglar boton de volver                                                                                      check
+- Boton de descargar musica                                                                                     check                          
+- Que si encuentra una cancion en la boveda no haga limpieza de archivos                                        check
+- Manejo de links                                                                                               check
+- Que no sea necesario el /start para usar el bot una vez iniciado si se llega a reiniciar el bot               check
+- Habilitar un menu el bot donde se muestren los comandos disponibles                                           check
+- Opcion de archivo zip
+

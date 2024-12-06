@@ -1,0 +1,454 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from yt_dlp import YoutubeDL
+import os
+import zipfile
+import asyncio
+from typing import Dict, List, Optional, Tuple
+import json
+import re
+import aiofiles
+from cachetools import TTLCache
+from db_connection import get_db_connection
+
+class MelodifyBot:
+    def __init__(self):
+        self.active_downloads: Dict[int, bool] = {}  # user_id: is_downloading
+        self.user_settings: Dict[int, Dict] = {}  # user_id: {language: str, quality: str}
+        self.VAULT_CHAT_ID = -4716061136  # Reemplazar con el ID real del grupo boveda
+        
+        self.vault_cache = TTLCache(maxsize=100, ttl=300)
+        self.translations = {
+            "es": {
+                "welcome": "¡Bienvenido a Melodify! 🎵\nEnvíame un enlace de YouTube para descargar música.\nPuedes enviar enlaces de canciones individuales o playlists.",
+                "download_music": "🎵 Descargar Música",
+                "settings": "⚙️ Configuración",
+                "donate": "💝 Donar",
+                "downloading": "⏳ Descargando...",
+                "download_complete": "✅ Descarga completada",
+                "download_error": "❌ Error en la descarga: {}",
+                "already_downloading": "Ya hay una descarga en proceso. Usa /cancel para cancelarla.",
+                "playlist_warning": "⚠️ La playlist contiene {} canciones.\n¿Deseas continuar con la descarga?",
+                "confirm": "✅ Confirmar",
+                "cancel": "❌ Cancelar",
+                "language_settings": " Configuración de idioma",
+                "quality_settings": "🎧 Configuración de calidad",
+                "current_language": "Idioma actual: {}",
+                "current_quality": "Calidad actual: {} kbps",
+                "searching_vault": "🔍 Buscando en la boveda...",
+                "found_in_vault": "✨ ¡Canción encontrada en la boveda!",
+                "saving_to_vault": "💾 Guardando en la boveda...",
+            },
+            "en": {
+                "welcome": "Welcome to Melodify! 🎵\nSend me a YouTube link to download music.\nYou can send individual songs or playlists.",
+                "download_music": "🎵 Download Music",
+                "settings": "⚙️ Settings",
+                "donate": "💝 Donate",
+                "downloading": "⏳ Downloading...",
+                "download_complete": "✅ Download complete",
+                "download_error": "❌ Download error: {}",
+                "already_downloading": "There's already an active download. Use /cancel to cancel it.",
+                "playlist_warning": "⚠️ The playlist contains {} songs.\nDo you want to continue?",
+                "confirm": "✅ Confirm",
+                "cancel": "❌ Cancel",
+                "language_settings": "🌍 Language Settings",
+                "quality_settings": "🎧 Quality Settings",
+                "current_language": "Current language: {}",
+                "current_quality": "Current quality: {} kbps",
+                "searching_vault": "🔍 Searching in vault...",
+                "found_in_vault": "✨ Song found in vault!",
+                "saving_to_vault": "💾 Saving to vault...",
+            }
+        }
+        
+    def get_text(self, user_id: int, key: str) -> str:
+        lang = self.user_settings.get(user_id, {}).get("language", "es")
+        return self.translations[lang].get(key, self.translations["es"][key])
+
+    def sanitize_filename(self, filename: str) -> str:
+        # Eliminar caracteres no permitidos y reemplazar espacios
+        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+        # Reemplazar espacios múltiples con un solo espacio
+        filename = re.sub(r'\s+', ' ', filename)
+        # Limitar la longitud del nombre del archivo
+        if len(filename) > 200:
+            filename = filename[:200]
+        return filename.strip()
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in self.user_settings:
+            self.user_settings[user_id] = {
+                "language": "es",
+                "quality": "320"
+            }
+        
+        keyboard = [
+            [InlineKeyboardButton(self.get_text(user_id, "download_music"), callback_data="download_menu")],
+            [InlineKeyboardButton(self.get_text(user_id, "settings"), callback_data="settings")],
+            [InlineKeyboardButton(self.get_text(user_id, "donate"), callback_data="donate")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            self.get_text(user_id, "welcome"),
+            reply_markup=reply_markup
+        )
+
+    async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        keyboard = [
+            [InlineKeyboardButton("🇪🇸 Español", callback_data="lang_es"),
+             InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
+            [InlineKeyboardButton("128 kbps", callback_data="quality_128"),
+             InlineKeyboardButton("320 kbps", callback_data="quality_320")],
+            [InlineKeyboardButton("🔙 Volver", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        current_settings = (
+            f"{self.get_text(user_id, 'current_language').format(self.user_settings[user_id]['language'])}\n"
+            f"{self.get_text(user_id, 'current_quality').format(self.user_settings[user_id]['quality'])}"
+        )
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(current_settings, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(current_settings, reply_markup=reply_markup)
+
+    async def donate_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("PayPal", url="https://paypal.me/yourusername")],
+            [InlineKeyboardButton("Patreon", url="https://patreon.com/yourusername")],
+            [InlineKeyboardButton("🔙 Volver", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.callback_query.edit_message_text(
+            "¡Gracias por considerar una donación! 💖\n"
+            "Tu apoyo ayuda a mantener y mejorar Melodify.",
+            reply_markup=reply_markup
+        )
+
+    async def cancel_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if self.active_downloads.get(user_id):
+            self.active_downloads[user_id] = False
+            await update.message.reply_text("❌ Descarga cancelada")
+        else:
+            await update.message.reply_text("No hay descargas activas para cancelar")
+
+    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        data = query.data
+
+        if data.startswith("lang_"):
+            lang = data.split("_")[1]
+            self.user_settings[user_id]["language"] = lang
+            await self.settings_menu(update, context)
+        
+        elif data.startswith("quality_"):
+            quality = data.split("_")[1]
+            self.user_settings[user_id]["quality"] = quality
+            await self.settings_menu(update, context)
+        
+        elif data == "settings":
+            await self.settings_menu(update, context)
+        
+        elif data == "donate":
+            await self.donate_menu(update, context)
+        
+        elif data == "back_to_main":
+            await self.start(update, context)
+
+    async def handle_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        url = update.message.text
+        user_id = update.effective_user.id
+        
+        if self.active_downloads.get(user_id):
+            await update.message.reply_text("Ya hay una descarga en proceso. Usa /cancel para cancelarla.")
+            return
+        
+        self.active_downloads[user_id] = True
+        
+        try:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': self.user_settings[user_id]["quality"],
+                }],
+                'extract_flat': True,
+                'add_metadata': True,
+                'writethumbnail': True,
+            }
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                
+                if 'entries' in info:  # Es una playlist
+                    await self._handle_playlist(update, context, info, ydl_opts)
+                else:  # Es una canción individual
+                    await self._handle_single_song(update, context, info, ydl_opts)
+                    
+        except Exception as e:
+            await update.message.reply_text(f"Error al procesar la descarga: {str(e)}")
+        finally:
+            self.active_downloads[user_id] = False
+
+    async def search_in_vault(self, context: ContextTypes.DEFAULT_TYPE, video_id: str) -> Optional[str]:
+        """Busca una canción en la bóveda usando el video_id."""
+        connection = get_db_connection()
+        if connection is None:
+            return None
+        
+        try:
+            cursor = connection.cursor()
+            query = "SELECT file_id FROM vault WHERE video_id = %s"
+            cursor.execute(query, (video_id,))
+            result = cursor.fetchone()
+            if result:
+                return result[0]  # Retorna file_id si se encuentra
+        except Exception as e:
+            print(f"Error buscando en bóveda: {e}")
+        finally:
+            cursor.close()
+            connection.close()
+        
+        return None
+    
+    async def save_to_vault(self, video_id: str, file_id: str, title: str, artist: str):
+        """Guarda la canción en la bóveda usando MySQL."""
+        connection = get_db_connection()
+        if connection is None:
+            return
+        
+        try:
+            cursor = connection.cursor()
+            query = """
+            INSERT INTO vault (video_id, file_id, title, artist)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE file_id = %s
+            """
+            cursor.execute(query, (video_id, file_id, title, artist, file_id))
+            connection.commit()
+        except Exception as e:
+            print(f"Error guardando en bóveda: {e}")
+        finally:
+            cursor.close()
+            connection.close()
+
+    async def _handle_single_song(self, update: Update, context: ContextTypes.DEFAULT_TYPE, info: dict, ydl_opts: dict):
+        user_id = update.effective_user.id
+        status_message = await update.message.reply_text(self.get_text(user_id, "searching_vault"))
+
+        try:
+            # Buscar en la bóveda usando MySQL
+            video_id = info['id']
+            file_id = await self.search_in_vault(context, video_id)
+            
+            if file_id:
+                try:
+                    await status_message.edit_text(self.get_text(user_id, "found_in_vault"))
+                    # Validar el file_id antes de usarlo
+                    file = await context.bot.get_file(file_id)
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=file.file_id,
+                        title=info['title'],
+                        performer=info.get('artist', info.get('uploader', 'Unknown')),
+                        caption=f"🎵 {info['title']}"
+                    )
+                    await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                    return
+                except Exception as e:
+                    print(f"Error al reenviar desde bóveda: {e}")
+            
+            # Si no está en la bóveda o falló el reenvío, descargar
+            await status_message.edit_text(self.get_text(user_id, "downloading"))
+            
+            # Sanitizar el nombre del archivo
+            safe_title = self.sanitize_filename(info['title'])
+            ydl_opts.update({
+                'outtmpl': f'{safe_title}.%(ext)s'
+            })
+            
+            # Descargar el archivo
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([info['webpage_url']])
+            
+            # Preparar nombres de archivo
+            mp3_filename = f"{safe_title}.mp3"
+            
+            try:
+                # Enviar a la bóveda primero
+                await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
+                
+                caption = (
+                    f"🎵 {info['title']}\n"
+                    f"👤 {info.get('artist', info.get('uploader', 'Unknown'))}\n"
+                    f"youtube_id:{video_id}"
+                )
+                
+                # Leer y enviar el archivo
+                async with aiofiles.open(mp3_filename, 'rb') as file:
+                    # Enviar a la bóveda
+                    vault_message = await context.bot.send_audio(
+                        chat_id=self.VAULT_CHAT_ID,
+                        audio=mp3_filename,  # Usar el path del archivo directamente
+                        title=info['title'],
+                        performer=info.get('artist', info.get('uploader', 'Unknown')),
+                        duration=info.get('duration'),
+                        caption=caption
+                    )
+                    
+                    # Guardar en la bóveda MySQL
+                    await self.save_to_vault(video_id, vault_message.audio.file_id, info['title'], info.get('artist', info.get('uploader', 'Unknown')))
+                    
+                    # Enviar al usuario usando el mismo archivo
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=mp3_filename,  # Usar el path del archivo directamente
+                        title=info['title'],
+                        performer=info.get('artist', info.get('uploader', 'Unknown')),
+                        duration=info.get('duration')
+                    )
+                
+                await status_message.edit_text(self.get_text(user_id, "download_complete"))
+            
+            except Exception as send_error:
+                print(f"Error al enviar archivo: {send_error}")
+                raise send_error
+            
+        except Exception as e:
+            await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
+        
+        finally:
+            # Limpieza de archivos
+            try:
+                await asyncio.sleep(1)
+                if 'mp3_filename' in locals() and os.path.exists(mp3_filename):
+                    os.remove(mp3_filename)
+            except Exception as e:
+                print(f"Error durante la limpieza: {e}")
+
+
+
+    async def _handle_playlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE, info: dict, ydl_opts: dict):
+        user_id = update.effective_user.id
+        status_message = await update.message.reply_text(self.get_text(user_id, "downloading"))
+        
+        downloaded_files = []
+        try:
+            for entry in info['entries']:
+                if not self.active_downloads.get(user_id):
+                    break
+                
+                # Buscar en la boveda primero
+                video_id = entry['id']
+                file_id = await self.search_in_vault(context, video_id)
+                
+                if file_id:
+                    # Si la canción existe en la boveda, descargarla usando el file_id
+                    try:
+                        safe_title = self.sanitize_filename(entry['title'])
+                        mp3_filename = f"{safe_title}.mp3"
+                        
+                        # Descargar el archivo usando el file_id
+                        file = await context.bot.get_file(file_id)
+                        await file.download_to_drive(mp3_filename)
+                        downloaded_files.append(mp3_filename)
+                        continue
+                    except Exception as e:
+                        print(f"Error al obtener archivo de boveda: {e}")
+                        # Si falla, continuamos con la descarga normal
+                
+                # Si no está en la boveda o falló la obtención, descargar normalmente
+                safe_title = self.sanitize_filename(entry['title'])
+                current_ydl_opts = ydl_opts.copy()
+                current_ydl_opts.update({
+                    'outtmpl': f'{safe_title}.%(ext)s'
+                })
+                
+                with YoutubeDL(current_ydl_opts) as ydl:
+                    ydl.download([entry['url']])
+                    mp3_filename = f"{safe_title}.mp3"
+                    
+                    if os.path.exists(mp3_filename):
+                        # Guardar en la boveda
+                        caption = (
+                            f"🎵 {entry['title']}\n"
+                            f"👤 {entry.get('artist', entry.get('uploader', 'Unknown'))}\n"
+                            f"youtube_id:{video_id}"
+                        )
+                        
+                        async with aiofiles.open(mp3_filename, 'rb') as file:
+                            await context.bot.send_audio(
+                                chat_id=self.VAULT_CHAT_ID,
+                                audio=file.fileno(),
+                                title=entry['title'],
+                                performer=entry.get('artist', entry.get('uploader', 'Unknown')),
+                                duration=entry.get('duration'),
+                                caption=caption,
+                                read_timeout=30,
+                                write_timeout=30,
+                                connect_timeout=30
+                            )
+                        
+                        downloaded_files.append(mp3_filename)
+            
+            if downloaded_files:
+                # Crear ZIP con nombre sanitizado
+                safe_playlist_name = self.sanitize_filename(info['title'])
+                zip_filename = f"playlist_{safe_playlist_name}.zip"
+                
+                # Crear ZIP de forma segura
+                with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                    for file in downloaded_files:
+                        if os.path.exists(file):
+                            zipf.write(file)
+                
+                # Enviar ZIP
+                async with aiofiles.open(zip_filename, 'rb') as zip_file:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=zip_file.fileno(),
+                        caption=f"Playlist: {info['title']}",
+                        read_timeout=30,
+                        write_timeout=30,
+                        connect_timeout=30
+                    )
+                
+                # Limpieza después de enviar
+                await asyncio.sleep(1)
+                for file in downloaded_files:
+                    if os.path.exists(file):
+                        os.remove(file)
+                if os.path.exists(zip_filename):
+                    os.remove(zip_filename)
+                
+                await status_message.edit_text(self.get_text(user_id, "download_complete"))
+            
+        except Exception as e:
+            await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
+
+    def run(self, token: str):
+        app = Application.builder().token(token).build()
+
+        
+        # Registrar handlers
+        app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("cancel", self.cancel_download))
+        app.add_handler(MessageHandler(filters.TEXT & filters.Entity("url"), self.handle_url))
+        app.add_handler(CallbackQueryHandler(self.callback_handler))
+        
+        # Iniciar el bot
+        app.run_polling()
+
+if __name__ == "__main__":
+    from config import TELEGRAM_TOKEN
+    
+    bot = MelodifyBot()
+    bot.run(TELEGRAM_TOKEN)
