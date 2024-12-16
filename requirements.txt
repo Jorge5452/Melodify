@@ -3,6 +3,8 @@ yt-dlp==2023.11.16
 ffmpeg-python==0.2.0
 aiofiles==23.2.1
 tenacity==8.2.2
+musicbrainzngs>=0.7.1
+mutagen>=1.45.1
 
 
 - Arreglar boton de volver                                                                                      check
@@ -11,5 +13,91 @@ tenacity==8.2.2
 - Manejo de links                                                                                               check
 - Que no sea necesario el /start para usar el bot una vez iniciado si se llega a reiniciar el bot               check
 - Habilitar un menu el bot donde se muestren los comandos disponibles                                           check
+- Que borre los mensajes de "Descargando..." y "Descarga completada" despues de un tiempo                       check
+- Que en telegram salga la miniatura de la cancion                                                              
 - Opcion de archivo zip
+- Opcion de donador para editar metadatos (10 usos gratis)
 
+----------------------------------------------------------------------------------------------
+prueba
+
+First Prompt:
+TOMA UN GRAN RESPIRO Y REALIZA LO SIGUIENTE:
+
+Utilizando musicbrainzngs, necesito que las canciones que se descarguen por medio del bot,  obtengan sus metadatos COMPLETOS para que se incrusten en el MP3 que recibe el usuario
+
+IMPORTANTE:
+- TANTO LO QUE SE ENVIA AL CHAT Y LO QUE DESCARGA EL USUARIO DEBE DE TENER LA INFORMACION CORRECTA DE LA CANCION.
+- EL FILTRO DE BUSQUEDA DE LOS DATOS DE LA CANCION SERA EL TITULO DE LA CANCION
+- PIENSA PASO A PASO EN UNA SOLUCION.
+````````````````````````````````````````````````````````````````````````````````````````````````
+Second Prompt:
+Vale, realiza el siguiente ajuste:
+
+Agrega que la cancion que se envia y el mp3 tenga la imagen (caratula) del album correcta
+
+Piensa paso a paso en una solucion
+````````````````````````````````````````````````````````````````````````````````````````````````
+Third Prompt:
+Toma un gran respiro y arregla el siguiente detalle:
+
+Las caratulas no se estan aplicando correctamente al MP3
+
+IMPORTANTE:
+- Piensa paso a paso en una solucion
+````````````````````````````````````````````````````````````````````````````````````````````````
+Fourth Prompt:
+TAKE A DEEP BREATH y ayudame:
+
+Sigue sin funcionar, en el chat de telegram si se ve la caratula, pero al DESCARGAR la cancion, no tiene caratula
+
+IMPORTANTE:
+
+- PIENSA PASO A PASO EN UNA SOLUCION
+````````````````````````````````````````````````````````````````````````````````````````````````
+Fifth Prompt:
+Nada, descargo la cancion y no tiene la foto del album
+
+Piensa paso a paso como resolver esto
+````````````````````````````````````````````````````````````````````````````````````````````````
+Sixth Prompt:
+
+Aun sigue sin aparecer la imagen del album en la cancion que se descarga desde el chat de telegram, arreglalo
+````````````````````````````````````````````````````````````````````````````````````````````````
+Seventh Prompt:
+TOMA UN GRAN RESPIRO Y REALIZA LO SIGUIENTE:
+
+Para hacer pruebas, implementa que el usuario pueda escoger que metadatos son los que se van a ingresar a la cancion, se van a mostrar las primeras 5 opciones
+
+IMPORTANTE:
+
+- PIENSA PASO A PASO EN UNA SOLUCION
+````````````````````````````````````````````````````````````````````````````````````````````````
+Eighth Prompt:
+
+Toma un gran respiro y realiza lo siguiente:
+
+Del filtro de busqueda de metadatos, recordaras que te he pedido que fuera por nombre de cancion, agrega que tambien se busque por: TITULO Y NOMBRE DEL ARTISTA
+
+IMPORTANTE:
+
+- REALIZA ESTO EN UN SOLO FILTRO
+- PIENSA PASO A PASO EN UNA SOLUCION
+````````````````````````````````````````````````````````````````````````````````````````````````
+Ninth Prompt:
+Dame los log en consola para saber que sucede con esto:
+
+"La búsqueda ahora:
+Intenta extraer título y artista del nombre del video
+Busca usando ambos campos si están disponibles
+Si no encuentra resultados, hace una búsqueda de respaldo solo con el título
+Mantiene la funcionalidad existente de mostrar opciones al usuario"
+````````````````````````````````````````````````````````````````````````````````````````````````
+Tenth Prompt:
+Ok, entiendo que esta pasando, el nombre del artista lo esta buscando en el titulo de la cancion, arregla esto, ese dato lo tiene que recuperar de los datos que ha recopilado anteriormente en el handle la libreria de yt_dlp
+
+IMPORTANTE El criterio que debe tomar es el siguiente:
+
+- Solo tomar el primer artista 
+- Agrega un filtro de (, - :) etc para el punto anterior y asi solo capturar el primer artista
+````````````````````````````````````````````````````````````````````````````````````````````````

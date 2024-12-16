@@ -244,59 +244,71 @@ class MelodifyBot:
             elif data == "back_to_main":
                 await self.start(update, context)
             
-            elif data.startswith("playlist_confirm_"):
+            elif data == "playlist_confirm":
                 print("[DEBUG] Iniciando descarga de playlist")
                 self.active_downloads[user_id] = True
-                
-                await query.edit_message_text("⏳ Iniciando descarga de playlist...")
-                playlist_info = context.user_data.get('playlist_info')
-                
-                if not playlist_info:
-                    print("[DEBUG] Error: No se encontró información de playlist")
-                    await query.edit_message_text("❌ Error: Información de playlist no encontrada")
-                    self.active_downloads[user_id] = False
-                    return
-                
-                print(f"[DEBUG] Información de playlist encontrada. Total canciones: {playlist_info['total']}")
-                context.progress_message = await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="Progreso: 0/" + str(playlist_info['total'])
-                )
-                
+
                 try:
-                    for i, entry in enumerate(playlist_info['entries'], 1):
-                        if not self.active_downloads.get(user_id):
-                            print("[DEBUG] Descarga cancelada por usuario")
-                            await context.progress_message.edit_text("❌ Descarga cancelada")
-                            return
-                        
+                    # Obtener información de la playlist
+                    playlist_info = context.user_data.get('playlist_info')
+                    if not playlist_info:
+                        print("[DEBUG] Error: No se encontró información de playlist")
+                        await query.edit_message_text("❌ Error: Información de playlist no encontrada")
+                        return
+
+                    # Guardar el mensaje original de confirmación antes de modificarlo
+                    confirmation_message = query.message
+                    
+                    # Actualizar el mensaje de confirmación para mostrar solo el botón de cancelar
+                    keyboard = [[InlineKeyboardButton("❌ Cancelar", callback_data="playlist_cancel")]]
+                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+                    
+                    # Crear mensaje de progreso
+                    progress_message = await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"⏳ Iniciando descarga...\nProgreso: 0/{playlist_info['total']}"
+                    )
+                    
+                    # Guardar referencias en context.user_data
+                    context.user_data['progress_message'] = progress_message
+                    context.user_data['confirmation_message'] = confirmation_message
+
+                    # Iniciar descarga
+                    await self._handle_playlist(update, context, playlist_info, playlist_info['ydl_opts'])
+                    
+                    # Mensaje final de éxito y programar su eliminación
+                    final_message = await progress_message.edit_text("✅ Descarga de playlist completada")
+                    
+                    # Programar eliminación de mensajes después de 10 segundos
+                    async def delete_messages():
+                        await asyncio.sleep(10)
                         try:
-                            print(f"[DEBUG] Obteniendo información detallada de la canción {entry.get('title', 'Unknown')}")
-                            with YoutubeDL({'extract_flat': False}) as ydl:
-                                song_info = ydl.extract_info(f"https://www.youtube.com/watch?v={entry['id']}", download=False)
-                            
-                            await context.progress_message.edit_text(
-                                f"Descargando: {i}/{playlist_info['total']}\n🎵 {song_info.get('title', 'Unknown')}"
-                            )
-                            await self._handle_single_song(update, context, song_info, playlist_info['ydl_opts'])
-                            print(f"[DEBUG] Canción {i} descargada exitosamente")
+                            # Eliminar mensaje final
+                            await final_message.delete()
+                            # Eliminar mensaje de confirmación
+                            await confirmation_message.delete()
                         except Exception as e:
-                            print(f"[DEBUG] Error al descargar canción {i}: {str(e)}")
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=f"❌ Error al descargar {entry.get('title', 'Unknown')}: {str(e)}"
-                            )
+                            print(f"[DEBUG] Error al eliminar mensajes: {e}")
+                    
+                    asyncio.create_task(delete_messages())
+                    
+                except Exception as e:
+                    print(f"[DEBUG] Error en descarga de playlist: {e}")
+                    if 'progress_message' in context.user_data:
+                        await context.user_data['progress_message'].edit_text(f"❌ Error: {str(e)}")
                 
-                    print("[DEBUG] Descarga de playlist completada")
-                    await context.progress_message.edit_text("✅ Descarga de playlist completada")
                 finally:
                     self.active_downloads[user_id] = False
-                    if hasattr(context, 'progress_message'):
-                        delattr(context, 'progress_message')
-            
+                    # Limpiar datos de contexto
+                    for key in ['progress_message', 'playlist_info', 'confirmation_message']:
+                        if key in context.user_data:
+                            del context.user_data[key]
+
             elif data == "playlist_cancel":
                 self.active_downloads[user_id] = False
                 await query.edit_message_text("❌ Descarga de playlist cancelada")
+                if 'playlist_info' in context.user_data:
+                    del context.user_data['playlist_info']
             
             elif data == "download_menu":
                 keyboard = [
@@ -392,15 +404,30 @@ class MelodifyBot:
                             'format': 'bestaudio/best',
                             'postprocessors': [{
                                 'key': 'FFmpegExtractAudio',
-                                'preferredcodec': 'mp3',
-                                'preferredquality': self.user_settings[user_id]["quality"],
+                                'preferredcodec': self.user_settings[user_id]["quality"],
                             }],
                             'extract_flat': True,
                             'add_metadata': True,
                             'writethumbnail': True,
                             'noplaylist': False,
                         }
-                        await self._handle_playlist(update, context, result, ydl_opts)
+                        # Enviar mensaje de confirmación al usuario antes de descargar
+                        total_songs = len(result['entries'])
+                        keyboard = [
+                            [InlineKeyboardButton(self.get_text(user_id, "confirm"), callback_data="playlist_confirm")],
+                            [InlineKeyboardButton(self.get_text(user_id, "cancel"), callback_data="playlist_cancel")]
+                        ]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        context.user_data['playlist_info'] = {
+                            'entries': result['entries'],
+                            'total': total_songs,
+                            'ydl_opts': ydl_opts
+                        }
+                        await update.message.reply_text(
+                            self.get_text(user_id, "playlist_warning").format(total_songs),
+                            reply_markup=reply_markup
+                        )
+                        return
                     else:
                         print("[DEBUG] Detectada canción individual")
                         self.active_downloads[user_id] = True
@@ -533,7 +560,10 @@ class MelodifyBot:
 
     async def _handle_single_song(self, update: Update, context: ContextTypes.DEFAULT_TYPE, info: dict, ydl_opts: dict):
         user_id = update.effective_user.id
-        files_created = []  # Lista para rastrear archivos creados
+        files_created = []
+        
+        # Verificar si estamos procesando una playlist
+        is_playlist = 'playlist_info' in context.user_data
         
         # Verificar cache
         cache_key = f"{info['id']}_{self.user_settings[user_id]['quality']}"
@@ -548,13 +578,11 @@ class MelodifyBot:
 
         print(f"[DEBUG] Iniciando _handle_single_song para usuario {user_id}")
         
-        # Determinar si venimos de un callback_query o un mensaje directo
         chat_id = update.effective_chat.id
         
-        # Si venimos de una playlist, no enviamos mensaje de status
-        if hasattr(context, 'progress_message'):
-            status_message = context.progress_message
-        else:
+        # Solo crear mensaje de status si NO es parte de una playlist
+        status_message = None
+        if not is_playlist:
             status_message = await context.bot.send_message(
                 chat_id=chat_id,
                 text=self.get_text(user_id, "searching_vault")
@@ -569,7 +597,7 @@ class MelodifyBot:
             if file_id:
                 print(f"[DEBUG] Canción encontrada en la bóveda con file_id: {file_id}")
                 try:
-                    if not hasattr(context, 'progress_message'):
+                    if not is_playlist:
                         await status_message.edit_text(self.get_text(user_id, "found_in_vault"))
                     # Validar el file_id antes de usarlo
                     file = await context.bot.get_file(file_id)
@@ -580,7 +608,7 @@ class MelodifyBot:
                         performer=info.get('artist', info.get('uploader', 'Unknown')),
                         caption=f"🎵 {info['title']}"
                     )
-                    if not hasattr(context, 'progress_message'):
+                    if status_message is not None and not is_playlist:
                         await status_message.edit_text(self.get_text(user_id, "download_complete"))
                     print("[DEBUG] Canción enviada desde la bóveda exitosamente")
                     self.download_cache[cache_key] = file.file_id
@@ -590,7 +618,7 @@ class MelodifyBot:
             
             # Si no está en la bóveda o falló el reenvío, descargar
             print("[DEBUG] Iniciando descarga de nueva canción")
-            if not hasattr(context, 'progress_message'):
+            if not is_playlist and status_message is not None:
                 await status_message.edit_text(self.get_text(user_id, "downloading"))
             
             # Sanitizar el nombre del archivo
@@ -640,7 +668,8 @@ class MelodifyBot:
             try:
                 # Enviar a la bóveda primero
                 print("[DEBUG] Enviando archivo a la bóveda")
-                await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
+                if status_message is not None and not is_playlist:
+                    await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
                 
                 caption = (
                     f"🎵 {info['title']}\n"
@@ -690,7 +719,8 @@ class MelodifyBot:
                     )
                     raise e  # Re-lanzar para manejo superior
                     
-                await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                if status_message is not None and not is_playlist:
+                    await status_message.edit_text(self.get_text(user_id, "download_complete"))
                 print("[DEBUG] Proceso completado exitosamente")
             
             except Exception as send_error:
@@ -700,7 +730,8 @@ class MelodifyBot:
             
         except Exception as e:
             print(f"[DEBUG] Error general en _handle_single_song: {e}")
-            await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
+            if status_message is not None and not is_playlist:
+                await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
         
         finally:
             # Solo realizar limpieza si se crearon archivos
@@ -741,17 +772,24 @@ class MelodifyBot:
 
         playlist_entries = info['entries']
         total_songs = len(playlist_entries)
-        
-        # Procesar en lotes
-        for i in range(0, total_songs, BATCH_SIZE):
-            batch = playlist_entries[i:i + BATCH_SIZE]
-            await process_batch(batch)
-            
-            # Actualizar progreso
-            if hasattr(context, 'progress_message'):
-                await context.progress_message.edit_text(
-                    f"Progreso: {min(i + BATCH_SIZE, total_songs)}/{total_songs}"
-                )
+
+        try:
+            # Procesar en lotes
+            for i in range(0, total_songs, BATCH_SIZE):
+                batch = playlist_entries[i:i + BATCH_SIZE]
+                await process_batch(batch)
+                
+                # Actualizar solo el mensaje de progreso
+                if 'progress_message' in context.user_data:
+                    await context.user_data['progress_message'].edit_text(
+                        f"⏳ Descargando...\nProgreso: {min(i + BATCH_SIZE, total_songs)}/{total_songs}"
+                    )
+        except Exception as e:
+            print(f"[DEBUG] Error en _handle_playlist: {e}")
+            raise
+        finally:
+            # La limpieza del mensaje se maneja en el callback_handler
+            pass
 
     def run(self, token: str):
         app = Application.builder().token(token).build()

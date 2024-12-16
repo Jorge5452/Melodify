@@ -1,6 +1,13 @@
 # Archivos de configuración
 config.py
 db_connection.py
+robado.py
+prueba.py
+codigo.txt
+Codigo2.txt
+codigo3.txt
+codigo4.txt
+codigo4.5.txt
 
 # Archivos temporales de Python
 __pycache__/
