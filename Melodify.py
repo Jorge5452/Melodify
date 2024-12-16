@@ -609,7 +609,15 @@ class MelodifyBot:
                         caption=f"🎵 {info['title']}"
                     )
                     if status_message is not None and not is_playlist:
-                        await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                        complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                        # Programar eliminación del mensaje después de 10 segundos
+                        async def delete_complete_message():
+                            await asyncio.sleep(10)
+                            try:
+                                await complete_message.delete()
+                            except Exception as e:
+                                print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
+                        asyncio.create_task(delete_complete_message())
                     print("[DEBUG] Canción enviada desde la bóveda exitosamente")
                     self.download_cache[cache_key] = file.file_id
                     return  # Retornamos directamente si se envió desde la bóveda
@@ -720,7 +728,15 @@ class MelodifyBot:
                     raise e  # Re-lanzar para manejo superior
                     
                 if status_message is not None and not is_playlist:
-                    await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                    complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                    # Programar eliminación del mensaje después de 10 segundos
+                    async def delete_complete_message():
+                        await asyncio.sleep(10)
+                        try:
+                            await complete_message.delete()
+                        except Exception as e:
+                            print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
+                    asyncio.create_task(delete_complete_message())
                 print("[DEBUG] Proceso completado exitosamente")
             
             except Exception as send_error:
@@ -731,7 +747,15 @@ class MelodifyBot:
         except Exception as e:
             print(f"[DEBUG] Error general en _handle_single_song: {e}")
             if status_message is not None and not is_playlist:
-                await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
+                error_message = await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
+                # También eliminar el mensaje de error después de 10 segundos
+                async def delete_error_message():
+                    await asyncio.sleep(10)
+                    try:
+                        await error_message.delete()
+                    except Exception as e:
+                        print(f"[DEBUG] Error al eliminar mensaje de error: {e}")
+                asyncio.create_task(delete_error_message())
         
         finally:
             # Solo realizar limpieza si se crearon archivos
