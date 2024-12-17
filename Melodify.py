@@ -14,11 +14,16 @@ import concurrent.futures
 from functools import partial
 from tenacity import retry, stop_after_attempt, wait_exponential
 from telegram.error import TimedOut
+import musicbrainzngs
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON
+import requests
+from io import BytesIO
 
 class MelodifyBot:
     def __init__(self):
         self.active_downloads: Dict[int, bool] = {}  # user_id: is_downloading
-        self.user_settings: Dict[int, Dict] = {}  # user_id: {language: str, quality: str}
+        self.user_settings: Dict[int, Dict] = {}  # user_id: {language: str, quality: str, metadata: bool}
         self.VAULT_CHAT_ID = VAULT_CHATID  # ID real del grupo boveda
         
         self.vault_cache = TTLCache(maxsize=100, ttl=300)
@@ -52,6 +57,10 @@ class MelodifyBot:
                     "⚡️ *Ejemplo:*\n"
                     "https://youtube.com/watch?v=ejemplo"
                 ),
+                "metadata_settings": "🎵 Metadatos",
+                "metadata_enabled": "✅ Metadatos: Activados",
+                "metadata_disabled": "❌ Metadatos: Desactivados",
+                "metadata_description": "Los metadatos incluyen título, artista, álbum y carátula de la canción.",
             },
             "en": {
                 "welcome": "Welcome to Melodify! 🎵\nSend me a YouTube link to download music.\nYou can send individual songs or playlists.",
@@ -82,6 +91,10 @@ class MelodifyBot:
                     "⚡️ *Example:*\n"
                     "https://youtube.com/watch?v=example"
                 ),
+                "metadata_settings": "🎵 Metadata",
+                "metadata_enabled": "✅ Metadata: Enabled",
+                "metadata_disabled": "❌ Metadata: Disabled",
+                "metadata_description": "Metadata includes song title, artist, album and cover art.",
             }
         }
         
@@ -89,14 +102,21 @@ class MelodifyBot:
         self.download_cache = TTLCache(maxsize=100, ttl=3600)  # Cache de 1 hora
         self.MAX_RETRIES = 3
         self.CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks para envío
+        
+        # Configurar musicbrainzngs
+        musicbrainzngs.set_useragent(
+            "Melodify",
+            "1.0",
+            "https://t.me/your_bot"  # Reemplaza con el enlace real de tu bot
+        )
 
     def get_text(self, user_id: int, key: str) -> str:
-        
-            # Si el usuario no existe en user_settings, inicializarlo con valores por defecto
+        # Si el usuario no existe en user_settings, inicializarlo con valores por defecto
         if user_id not in self.user_settings:
             self.user_settings[user_id] = {
                 "language": "es",
-                "quality": "320"
+                "quality": "320",
+                "metadata": False  # Metadatos desactivados por defecto
             }
         lang = self.user_settings.get(user_id, {}).get("language", "es")
         return self.translations[lang].get(key, self.translations["es"][key])
@@ -116,7 +136,8 @@ class MelodifyBot:
         if user_id not in self.user_settings:
             self.user_settings[user_id] = {
                 "language": "es",
-                "quality": "320"
+                "quality": "320",
+                "metadata": False  # Metadatos desactivados por defecto
             }
         
         keyboard = [
@@ -145,13 +166,19 @@ class MelodifyBot:
              InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
             [InlineKeyboardButton("128 kbps", callback_data="quality_128"),
              InlineKeyboardButton("320 kbps", callback_data="quality_320")],
+            [InlineKeyboardButton(
+                "✅ Metadatos" if self.user_settings[user_id].get('metadata', False) else "❌ Metadatos", 
+                callback_data="toggle_metadata"
+            )],
             [InlineKeyboardButton("🔙 Volver", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         current_settings = (
             f"{self.get_text(user_id, 'current_language').format(self.user_settings[user_id]['language'])}\n"
-            f"{self.get_text(user_id, 'current_quality').format(self.user_settings[user_id]['quality'])}"
+            f"{self.get_text(user_id, 'current_quality').format(self.user_settings[user_id]['quality'])}\n"
+            f"{self.get_text(user_id, 'metadata_enabled' if self.user_settings[user_id].get('metadata', False) else 'metadata_disabled')}\n\n"
+            f"{self.get_text(user_id, 'metadata_description')}"
         )
         
         if update.callback_query:
@@ -324,6 +351,12 @@ class MelodifyBot:
                     disable_web_page_preview=True,
                     reply_markup=reply_markup
                 )
+
+            elif data == "toggle_metadata":
+                # Toggle el estado de los metadatos
+                current_state = self.user_settings[user_id].get('metadata', False)
+                self.user_settings[user_id]['metadata'] = not current_state
+                await self.settings_menu(update, context)
 
         except Exception as e:
             print(f"[DEBUG] Error en callback_handler: {e}")
@@ -674,75 +707,99 @@ class MelodifyBot:
             print(f"[DEBUG] Nombre final del archivo MP3: {mp3_filename}")
             
             try:
-                # Enviar a la bóveda primero
-                print("[DEBUG] Enviando archivo a la bóveda")
-                if status_message is not None and not is_playlist:
-                    await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
+                # Después de la descarga exitosa del archivo
+                metadata_enabled = self.user_settings[user_id].get('metadata', False)
                 
-                caption = (
-                    f"🎵 {info['title']}\n"
-                    f"👤 {info.get('artist', info.get('uploader', 'Unknown'))}\n"
-                    f"youtube_id:{video_id}"
+                if metadata_enabled:
+                    print("[DEBUG] Obteniendo metadatos de la canción")
+                    metadata = await self.get_track_metadata(info['title'], info)
+                    
+                    if metadata:
+                        print("[DEBUG] Aplicando metadatos al archivo")
+                        cover_path = await self.apply_metadata(mp3_filename, metadata)
+                        
+                        # Actualizar la información para el envío
+                        info['title'] = metadata['title']
+                        info['artist'] = metadata['artist']
+                        
+                        if cover_path:
+                            files_created.append(cover_path)
+                
+                # Continuar con el envío del archivo...
+                
+            except Exception as e:
+                print(f"[DEBUG] Error en el procesamiento de metadatos: {e}")
+                # Continuar con el envío del archivo sin metadatos
+                
+            # Enviar a la bóveda primero
+            print("[DEBUG] Enviando archivo a la bóveda")
+            if status_message is not None and not is_playlist:
+                await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
+            
+            caption = (
+                f"🎵 {info['title']}\n"
+                f"👤 {info.get('artist', info.get('uploader', 'Unknown'))}\n"
+                f"youtube_id:{video_id}"
+            )
+            
+            try:
+                # Enviar a la bóveda con reintentos
+                vault_message = await self.send_large_audio(
+                    context,
+                    self.VAULT_CHAT_ID,
+                    mp3_filename,
+                    title=info['title'],
+                    performer=info.get('artist', info.get('uploader', 'Unknown')),
+                    duration=info.get('duration'),
+                    caption=caption
                 )
                 
-                try:
-                    # Enviar a la bóveda con reintentos
-                    vault_message = await self.send_large_audio(
-                        context,
-                        self.VAULT_CHAT_ID,
-                        mp3_filename,
-                        title=info['title'],
-                        performer=info.get('artist', info.get('uploader', 'Unknown')),
-                        duration=info.get('duration'),
-                        caption=caption
-                    )
-                    
-                    print("[DEBUG] Guardando información en base de datos")
-                    await self.save_to_vault(
-                        video_id, 
-                        vault_message.audio.file_id, 
-                        info['title'], 
-                        info.get('artist', info.get('uploader', 'Unknown'))
-                    )
-                    
-                    # Enviar al usuario usando el mismo file_id
-                    await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=vault_message.audio.file_id,  # Usar file_id en lugar de reenviar archivo
-                        title=info['title'],
-                        performer=info.get('artist', info.get('uploader', 'Unknown')),
-                        duration=info.get('duration')
-                    )
-                    
-                except TimedOut as e:
-                    print(f"[DEBUG] Timeout al enviar archivo: {e}")
-                    # Intentar enviar directamente al usuario si falló la bóveda
-                    user_message = await self.send_large_audio(
-                        context,
-                        update.effective_chat.id,
-                        mp3_filename,
-                        title=info['title'],
-                        performer=info.get('artist', info.get('uploader', 'Unknown')),
-                        duration=info.get('duration')
-                    )
-                    raise e  # Re-lanzar para manejo superior
-                    
-                if status_message is not None and not is_playlist:
-                    complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
-                    # Programar eliminación del mensaje después de 10 segundos
-                    async def delete_complete_message():
-                        await asyncio.sleep(10)
-                        try:
-                            await complete_message.delete()
-                        except Exception as e:
-                            print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
-                    asyncio.create_task(delete_complete_message())
-                print("[DEBUG] Proceso completado exitosamente")
+                print("[DEBUG] Guardando información en base de datos")
+                await self.save_to_vault(
+                    video_id, 
+                    vault_message.audio.file_id, 
+                    info['title'], 
+                    info.get('artist', info.get('uploader', 'Unknown'))
+                )
+                
+                # Enviar al usuario usando el mismo file_id
+                await context.bot.send_audio(
+                    chat_id=update.effective_chat.id,
+                    audio=vault_message.audio.file_id,  # Usar file_id en lugar de reenviar archivo
+                    title=info['title'],
+                    performer=info.get('artist', info.get('uploader', 'Unknown')),
+                    duration=info.get('duration')
+                )
+                
+            except TimedOut as e:
+                print(f"[DEBUG] Timeout al enviar archivo: {e}")
+                # Intentar enviar directamente al usuario si falló la bóveda
+                user_message = await self.send_large_audio(
+                    context,
+                    update.effective_chat.id,
+                    mp3_filename,
+                    title=info['title'],
+                    performer=info.get('artist', info.get('uploader', 'Unknown')),
+                    duration=info.get('duration')
+                )
+                raise e  # Re-lanzar para manejo superior
+                
+            if status_message is not None and not is_playlist:
+                complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                # Programar eliminación del mensaje después de 10 segundos
+                async def delete_complete_message():
+                    await asyncio.sleep(10)
+                    try:
+                        await complete_message.delete()
+                    except Exception as e:
+                        print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
+                asyncio.create_task(delete_complete_message())
+            print("[DEBUG] Proceso completado exitosamente")
             
-            except Exception as send_error:
-                print(f"[DEBUG] Error al enviar archivo: {send_error}")
-                if not isinstance(send_error, TimedOut):
-                    raise send_error
+        except Exception as send_error:
+            print(f"[DEBUG] Error al enviar archivo: {send_error}")
+            if not isinstance(send_error, TimedOut):
+                raise send_error
             
         except Exception as e:
             print(f"[DEBUG] Error general en _handle_single_song: {e}")
@@ -806,7 +863,7 @@ class MelodifyBot:
                 # Actualizar solo el mensaje de progreso
                 if 'progress_message' in context.user_data:
                     await context.user_data['progress_message'].edit_text(
-                        f"⏳ Descargando...\nProgreso: {min(i + BATCH_SIZE, total_songs)}/{total_songs}"
+                        f" Descargando...\nProgreso: {min(i + BATCH_SIZE, total_songs)}/{total_songs}"
                     )
         except Exception as e:
             print(f"[DEBUG] Error en _handle_playlist: {e}")
@@ -829,6 +886,232 @@ class MelodifyBot:
         
         # Iniciar el bot
         app.run_polling()
+
+    async def get_track_metadata(self, title: str, info: dict) -> dict:
+        """Busca y obtiene los metadatos de una canción usando múltiples estrategias de búsqueda."""
+        try:
+            print("\n=== INICIO DE BÚSQUEDA DE METADATOS ===")
+            print(f"[DEBUG] Título original: {title}")
+            
+            # 1. Extraer artista de los metadatos de YouTube
+            artist = None
+            if 'artist' in info:
+                artist = info['artist']
+            elif 'creator' in info:
+                artist = info['creator']
+            elif 'uploader' in info:
+                artist = info['uploader']
+            print(f"[DEBUG] Artista de metadatos: {artist}")
+
+            # 2. PRIMER FILTRO: Buscar por título después del guion
+            print("\n[DEBUG] === INICIANDO PRIMER FILTRO: TÍTULO DESPUÉS DEL GUION ===")
+            if ' - ' in title:
+                split_title = title.split(' - ')
+                potential_artist = split_title[0].strip()
+                potential_title = split_title[1].strip()
+                
+                # Limpiar el título extraído
+                clean_split_title = re.sub(r'\(.*?\)|\[.*?\]|Official.*?Video|Lyrics?|HD|HQ|Official|Video|Audio', '', potential_title, flags=re.IGNORECASE).strip()
+                print(f"[DEBUG] Título extraído después del guion: {clean_split_title}")
+                print(f"[DEBUG] Artista extraído antes del guion: {potential_artist}")
+                
+                # Intentar búsqueda con estos datos
+                query = f'recording:"{clean_split_title}" AND artist:"{potential_artist}"'
+                print(f"[DEBUG] Búsqueda del primer filtro: {query}")
+                result = musicbrainzngs.search_recordings(query=query, limit=5)
+                
+                if result.get('recording-list'):
+                    print("[DEBUG] ✅ Resultados encontrados con el primer filtro")
+                    return await self._process_results(result, clean_split_title, potential_artist)
+
+            # 3. SEGUNDO FILTRO: Búsqueda por título y artista de metadatos
+            print("\n[DEBUG] === INICIANDO SEGUNDO FILTRO: TÍTULO Y ARTISTA DE METADATOS ===")
+            if artist:
+                # Limpiar título y artista
+                clean_title = re.sub(r'\(.*?\)|\[.*?\]|Official.*?Video|Lyrics?|HD|HQ|Official|Video|Audio', '', title, flags=re.IGNORECASE).strip()
+                clean_artist = re.sub(r'\(.*?\)|\[.*?\]|VEVO|Official|Channel|Topic', '', artist, flags=re.IGNORECASE)
+                clean_artist = clean_artist.split(',')[0].split('feat.')[0].split('ft.')[0].split('&')[0].strip()
+                
+                print(f"[DEBUG] Título limpio: {clean_title}")
+                print(f"[DEBUG] Artista limpio: {clean_artist}")
+                
+                query = f'recording:"{clean_title}" AND artist:"{clean_artist}"'
+                print(f"[DEBUG] Búsqueda del segundo filtro: {query}")
+                result = musicbrainzngs.search_recordings(query=query, limit=5)
+                
+                if result.get('recording-list'):
+                    print("[DEBUG] ✅ Resultados encontrados con el segundo filtro")
+                    return await self._process_results(result, clean_title, clean_artist)
+
+            # 4. TERCER FILTRO: Búsqueda solo por título
+            print("\n[DEBUG] === INICIANDO TERCER FILTRO: SOLO TÍTULO ===")
+            clean_title = re.sub(r'\(.*?\)|\[.*?\]|Official.*?Video|Lyrics?|HD|HQ|Official|Video|Audio', '', title, flags=re.IGNORECASE).strip()
+            query = f'recording:"{clean_title}"'
+            print(f"[DEBUG] Búsqueda del tercer filtro: {query}")
+            result = musicbrainzngs.search_recordings(query=query, limit=5)
+            
+            if result.get('recording-list'):
+                print("[DEBUG] ✅ Resultados encontrados con el tercer filtro")
+                return await self._process_results(result, clean_title, None)
+            
+            print("[DEBUG] ❌ No se encontraron coincidencias en ningún filtro")
+            return None
+
+        except Exception as e:
+            print(f"\n[DEBUG] ❌ Error general en get_track_metadata: {e}")
+            print("=== FIN DE BÚSQUEDA DE METADATOS CON ERROR ===")
+            return None
+
+    async def _process_results(self, result: dict, clean_title: str, artist: Optional[str]) -> dict:
+        """Procesa los resultados de la búsqueda y obtiene los metadatos detallados."""
+        try:
+            print("\n[DEBUG] Procesando resultados de búsqueda...")
+            print(f"[DEBUG] 🎯 Se encontraron {len(result['recording-list'])} resultados")
+            
+            # Mostrar todos los resultados encontrados
+            for i, recording in enumerate(result['recording-list'], 1):
+                print(f"\n--- Resultado {i} ---")
+                print(f"Título: {recording.get('title', 'No disponible')}")
+                print(f"Artista: {recording.get('artist-credit-phrase', 'No disponible')}")
+                if 'release-list' in recording:
+                    print(f"Álbum: {recording['release-list'][0]['title']}")
+                print(f"ID: {recording['id']}")
+            
+            # Obtener información detallada del primer resultado
+            recording = result['recording-list'][0]
+            recording_id = recording['id']
+            
+            print(f"\n[DEBUG] Obteniendo detalles del recording ID: {recording_id}")
+            full_info = musicbrainzngs.get_recording_by_id(recording_id, includes=['artists', 'releases'])
+            
+            # Construir metadata
+            metadata = {
+                'title': recording.get('title', clean_title),
+                'artist': recording.get('artist-credit-phrase', artist or 'Unknown Artist'),
+                'album': None,
+                'year': None,
+                'genre': None,
+                'cover_url': None
+            }
+            
+            # Obtener información del álbum y carátula
+            if 'release-list' in full_info['recording']:
+                release = full_info['recording']['release-list'][0]
+                metadata['album'] = release['title']
+                metadata['year'] = release['date'][:4] if 'date' in release else None
+                
+                try:
+                    print("[DEBUG] Buscando carátula del álbum...")
+                    cover_art = musicbrainzngs.get_image_list(release['id'])
+                    if cover_art['images']:
+                        front_images = [img for img in cover_art['images'] if img.get('front', False)]
+                        if front_images:
+                            metadata['cover_url'] = front_images[0]['image']
+                            print("[DEBUG] ✅ Carátula encontrada")
+                except Exception as e:
+                    print(f"[DEBUG] Error al obtener carátula: {e}")
+            
+            print("\n[DEBUG] Metadatos finales:")
+            for key, value in metadata.items():
+                print(f"{key}: {value}")
+            
+            return metadata
+            
+        except Exception as e:
+            print(f"[DEBUG] Error al procesar resultados: {e}")
+            return None
+
+    async def apply_metadata(self, mp3_path: str, metadata: dict) -> Optional[str]:
+        """
+        Aplica los metadatos al archivo MP3 y retorna la ruta de la carátula si se descargó.
+        Returns:
+            Optional[str]: Ruta del archivo de carátula o None si no hay carátula
+        """
+        try:
+            print("\n=== INICIO DE APLICACIÓN DE METADATOS ===")
+            # Crear o cargar las etiquetas ID3
+            audio = MP3(mp3_path, ID3=ID3)
+            
+            if metadata is None:
+                print("[DEBUG] No hay metadatos para aplicar")
+                return None
+            
+            # Asegurarse de que existe una etiqueta ID3
+            if audio.tags is None:
+                audio.add_tags()
+            
+            # Aplicar metadatos básicos
+            print("[DEBUG] Aplicando metadatos básicos...")
+            audio.tags.add(TIT2(encoding=3, text=metadata['title']))
+            audio.tags.add(TPE1(encoding=3, text=metadata['artist']))
+            if metadata.get('album'):
+                audio.tags.add(TALB(encoding=3, text=metadata['album']))
+            if metadata.get('year'):
+                audio.tags.add(TDRC(encoding=3, text=metadata['year']))
+            if metadata.get('genre'):
+                audio.tags.add(TCON(encoding=3, text=metadata['genre']))
+            
+            # Manejar la carátula
+            cover_path = None
+            if metadata.get('cover_url'):
+                try:
+                    print("[DEBUG] Descargando carátula del álbum...")
+                    # Crear nombre único para la carátula
+                    cover_path = f"{os.path.splitext(mp3_path)[0]}_cover.jpg"
+                    
+                    # Descargar la imagen
+                    response = requests.get(metadata['cover_url'])
+                    response.raise_for_status()
+                    
+                    # Guardar la imagen localmente
+                    with open(cover_path, 'wb') as img_file:
+                        img_file.write(response.content)
+                    print(f"[DEBUG] Carátula guardada en: {cover_path}")
+                    
+                    # Leer la imagen para incrustarla
+                    with open(cover_path, 'rb') as img_file:
+                        img_data = img_file.read()
+                    
+                    # Eliminar carátulas existentes
+                    for key in list(audio.tags.keys()):
+                        if key.startswith('APIC:'):
+                            del audio.tags[key]
+                    
+                    # Agregar la nueva carátula
+                    print("[DEBUG] Incrustando carátula en el MP3...")
+                    audio.tags.add(
+                        APIC(
+                            encoding=3,
+                            mime='image/jpeg',
+                            type=3,  # 3 es para la carátula frontal
+                            desc='Cover',
+                            data=img_data
+                        )
+                    )
+                    
+                    # Verificar que la carátula se incrustó correctamente
+                    audio.save()
+                    verify_audio = ID3(mp3_path)
+                    if any(key.startswith('APIC:') for key in verify_audio.keys()):
+                        print("[DEBUG] ✅ Carátula incrustada correctamente")
+                    else:
+                        print("[DEBUG] ⚠️ Advertencia: No se detectó la carátula después de incrustarla")
+                    
+                except Exception as e:
+                    print(f"[DEBUG] ❌ Error al procesar la carátula: {e}")
+                    if cover_path and os.path.exists(cover_path):
+                        os.remove(cover_path)
+                    cover_path = None
+            
+            # Guardar los cambios finales
+            audio.save(v2_version=3)  # Forzar versión ID3v2.3 para mejor compatibilidad
+            print("[DEBUG] ✅ Metadatos aplicados exitosamente")
+            
+            return cover_path
+            
+        except Exception as e:
+            print(f"[DEBUG] ❌ Error al aplicar metadatos: {e}")
+            return None
 
 if __name__ == "__main__":
     from config import TELEGRAM_TOKEN, VAULT_CHATID
