@@ -61,6 +61,12 @@ class MelodifyBot:
                 "metadata_enabled": "✅ Metadatos: Activados",
                 "metadata_disabled": "❌ Metadatos: Desactivados",
                 "metadata_description": "Los metadatos incluyen título, artista, álbum y carátula de la canción.",
+                "metadata_limit_reached": "❌ Has alcanzado el límite de 70 canciones con metadatos. Para continuar usando esta función, considera hacer una donación.",
+                "metadata_donor_only": "⭐️ Función exclusiva para donadores. Tienes {}/70 usos gratuitos restantes.",
+                "donor_added": "✅ Usuario agregado como donador exitosamente.",
+                "donor_removed": "❌ Usuario removido de la lista de donadores.",
+                "not_admin": "❌ No tienes permisos para usar este comando.",
+                "invalid_command": "❌ Uso incorrecto del comando. Usa /donor add/remove USER_ID",
             },
             "en": {
                 "welcome": "Welcome to Melodify! 🎵\nSend me a YouTube link to download music.\nYou can send individual songs or playlists.",
@@ -95,6 +101,12 @@ class MelodifyBot:
                 "metadata_enabled": "✅ Metadata: Enabled",
                 "metadata_disabled": "❌ Metadata: Disabled",
                 "metadata_description": "Metadata includes song title, artist, album and cover art.",
+                "metadata_limit_reached": "❌ You've reached the 70 songs limit for metadata. To continue using this feature, consider making a donation.",
+                "metadata_donor_only": "⭐️ Donor-exclusive feature. You have {}/70 free uses remaining.",
+                "donor_added": "✅ User successfully added as donor.",
+                "donor_removed": " User removed from donors list.",
+                "not_admin": "❌ You don't have permission to use this command.",
+                "invalid_command": "❌ Invalid command usage. Use /donor add/remove USER_ID",
             }
         }
         
@@ -109,6 +121,14 @@ class MelodifyBot:
             "1.0",
             "https://t.me/your_bot"  # Reemplaza con el enlace real de tu bot
         )
+
+        self.donor_users = set()  # Se llenará desde la base de datos
+        self.metadata_usage = {}  # Contador de uso de metadatos por usuario
+        self.ADMIN_USERS = {int(ADMIN_CHATID)}
+        self.METADATA_LIMIT = 70
+        
+        # Cargar donadores al iniciar
+        asyncio.get_event_loop().run_until_complete(self.load_donors_from_db())
 
     def get_text(self, user_id: int, key: str) -> str:
         # Si el usuario no existe en user_settings, inicializarlo con valores por defecto
@@ -161,15 +181,20 @@ class MelodifyBot:
 
     async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
+        is_donor = user_id in self.donor_users
+        remaining_uses = await self.get_metadata_remaining(user_id)
+        
+        # Construir el texto del botón de metadatos
+        metadata_text = "✅ Metadatos (∞)" if is_donor else (
+            "✅ Metadatos ({}/70)" if self.user_settings[user_id].get('metadata', False) else "❌ Metadatos ({}/70)"
+        ).format(remaining_uses)
+        
         keyboard = [
             [InlineKeyboardButton("🇪🇸 Español", callback_data="lang_es"),
              InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
             [InlineKeyboardButton("128 kbps", callback_data="quality_128"),
              InlineKeyboardButton("320 kbps", callback_data="quality_320")],
-            [InlineKeyboardButton(
-                "✅ Metadatos" if self.user_settings[user_id].get('metadata', False) else "❌ Metadatos", 
-                callback_data="toggle_metadata"
-            )],
+            [InlineKeyboardButton(metadata_text, callback_data="toggle_metadata")],
             [InlineKeyboardButton("🔙 Volver", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -428,7 +453,7 @@ class MelodifyBot:
                     if is_playlist:
                         if not result['entries']:
                             await update.message.reply_text(
-                                "❌ La playlist está vacía o es privada."
+                                "La playlist está vacía o es privada."
                             )
                             return
                         
@@ -707,23 +732,34 @@ class MelodifyBot:
             print(f"[DEBUG] Nombre final del archivo MP3: {mp3_filename}")
             
             try:
-                # Después de la descarga exitosa del archivo
                 metadata_enabled = self.user_settings[user_id].get('metadata', False)
                 
                 if metadata_enabled:
-                    print("[DEBUG] Obteniendo metadatos de la canción")
-                    metadata = await self.get_track_metadata(info['title'], info)
-                    
-                    if metadata:
-                        print("[DEBUG] Aplicando metadatos al archivo")
-                        cover_path = await self.apply_metadata(mp3_filename, metadata)
+                    # Verificar si puede usar metadatos
+                    if not await self.can_use_metadata(user_id):
+                        metadata_message = await update.message.reply_text(self.get_text(user_id, "metadata_limit_reached"))                        
+                        async def delete_metadata_message():
+                            await asyncio.sleep(10)
+                            try:
+                                await metadata_message.delete()
+                            except Exception as e:
+                                print(f"[DEBUG] Error al eliminar mensaje de metadatos: {e}")
+                        asyncio.create_task(delete_metadata_message())
+                    else:
+                        print("[DEBUG] Obteniendo metadatos de la canción")
+                        metadata = await self.get_track_metadata(info['title'], info)
                         
-                        # Actualizar la información para el envío
-                        info['title'] = metadata['title']
-                        info['artist'] = metadata['artist']
-                        
-                        if cover_path:
-                            files_created.append(cover_path)
+                        if metadata:
+                            print("[DEBUG] Aplicando metadatos al archivo")
+                            await self.apply_metadata(mp3_filename, metadata)
+                            await self.increment_metadata_usage(user_id)
+                            
+                            # Actualizar la información para el envío
+                            info['title'] = metadata['title']
+                            info['artist'] = metadata['artist']
+                            
+                            if cover_path:
+                                files_created.append(cover_path)
                 
                 # Continuar con el envío del archivo...
                 
@@ -883,6 +919,7 @@ class MelodifyBot:
         app.add_handler(CommandHandler("configuracion", self.configuracion_command))  # Nuevo
         app.add_handler(MessageHandler(filters.TEXT & filters.Entity("url"), self.handle_url))
         app.add_handler(CallbackQueryHandler(self.callback_handler))
+        app.add_handler(CommandHandler("donor", self.donor_command))
         
         # Iniciar el bot
         app.run_polling()
@@ -1113,8 +1150,171 @@ class MelodifyBot:
             print(f"[DEBUG] ❌ Error al aplicar metadatos: {e}")
             return None
 
+    async def donor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando para administrar usuarios donadores. Solo para admins."""
+        user_id = update.effective_user.id
+        
+        if user_id not in self.ADMIN_USERS:
+            await update.message.reply_text(self.get_text(user_id, "not_admin"))
+            return
+        
+        try:
+            if not context.args or len(context.args) != 2:
+                await update.message.reply_text(self.get_text(user_id, "invalid_command"))
+                return
+            
+            action, target_id = context.args
+            target_id = int(target_id)
+            
+            # Asegurarse de que el usuario existe en la base de datos
+            await self.get_user_data(target_id)
+            
+            if action.lower() == "add":
+                if await self.set_user_donor_status(target_id, True):
+                    self.donor_users.add(target_id)  # Mantener caché en memoria
+                    await update.message.reply_text(self.get_text(user_id, "donor_added"))
+                else:
+                    await update.message.reply_text("❌ Error al actualizar el estado del donador")
+            
+            elif action.lower() == "remove":
+                if await self.set_user_donor_status(target_id, False):
+                    self.donor_users.discard(target_id)  # Actualizar caché en memoria
+                    await update.message.reply_text(self.get_text(user_id, "donor_removed"))
+                else:
+                    await update.message.reply_text("❌ Error al actualizar el estado del donador")
+            else:
+                await update.message.reply_text(self.get_text(user_id, "invalid_command"))
+            
+        except ValueError:
+            await update.message.reply_text(self.get_text(user_id, "invalid_command"))
+
+    async def can_use_metadata(self, user_id: int) -> bool:
+        """Verifica si un usuario puede usar la función de metadatos."""
+        user_data = await self.get_user_data(user_id)
+        if not user_data:
+            return False
+        
+        # Si es donador, siempre puede usar metadatos
+        if user_data['is_donor']:
+            return True
+        
+        # Verificar el límite para usuarios no donadores
+        return user_data['download_count'] < self.METADATA_LIMIT
+
+    async def increment_metadata_usage(self, user_id: int):
+        """Incrementa el contador de uso de metadatos."""
+        user_data = await self.get_user_data(user_id)
+        if not user_data['is_donor']:
+            await self.update_user_metadata_count(user_id)
+
+    async def get_metadata_remaining(self, user_id: int) -> int:
+        """Obtiene el número de usos restantes de metadatos."""
+        user_data = await self.get_user_data(user_id)
+        if not user_data:
+            return 0
+        
+        if user_data['is_donor']:
+            return float('inf')
+        return max(0, self.METADATA_LIMIT - user_data['download_count'])
+
+    async def get_user_data(self, user_id: int) -> dict:
+        """Obtiene o crea los datos del usuario en la base de datos."""
+        connection = get_db_connection()
+        if connection is None:
+            return None
+        
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # Intentar obtener el usuario
+            query = "SELECT * FROM users WHERE user_id = %s"
+            cursor.execute(query, (user_id,))
+            user_data = cursor.fetchone()
+            
+            # Si el usuario no existe, crearlo
+            if not user_data:
+                print(f"[DEBUG] Creando nuevo usuario {user_id} en la base de datos")
+                insert_query = "INSERT INTO users (user_id, is_donor, download_count) VALUES (%s, FALSE, 0)"
+                cursor.execute(insert_query, (user_id,))
+                connection.commit()
+                
+                # Obtener los datos del usuario recién creado
+                cursor.execute(query, (user_id,))
+                user_data = cursor.fetchone()
+            
+            return user_data
+        
+        except Exception as e:
+            print(f"[DEBUG] Error en get_user_data: {e}")
+            return None
+        finally:
+            cursor.close()
+            connection.close()
+
+    async def update_user_metadata_count(self, user_id: int) -> bool:
+        """Incrementa el contador de descargas con metadatos del usuario."""
+        connection = get_db_connection()
+        if connection is None:
+            return False
+        
+        try:
+            cursor = connection.cursor()
+            query = "UPDATE users SET download_count = download_count + 1 WHERE user_id = %s"
+            cursor.execute(query, (user_id,))
+            connection.commit()
+            return True
+        except Exception as e:
+            print(f"[DEBUG] Error en update_user_metadata_count: {e}")
+            return False
+        finally:
+            cursor.close()
+            connection.close()
+
+    async def set_user_donor_status(self, user_id: int, is_donor: bool) -> bool:
+        """Actualiza el estado de donador del usuario."""
+        connection = get_db_connection()
+        if connection is None:
+            return False
+        
+        try:
+            cursor = connection.cursor()
+            query = """
+            UPDATE users 
+            SET is_donor = %s, 
+                donation_date = CASE WHEN %s = TRUE THEN CURRENT_TIMESTAMP ELSE NULL END
+            WHERE user_id = %s
+            """
+            cursor.execute(query, (is_donor, is_donor, user_id))
+            connection.commit()
+            return True
+        except Exception as e:
+            print(f"[DEBUG] Error en set_user_donor_status: {e}")
+            return False
+        finally:
+            cursor.close()
+            connection.close()
+
+    async def load_donors_from_db(self):
+        """Carga los donadores desde la base de datos."""
+        connection = get_db_connection()
+        if connection is None:
+            return
+        
+        try:
+            cursor = connection.cursor()
+            query = "SELECT user_id FROM users WHERE is_donor = TRUE"
+            cursor.execute(query)
+            donors = cursor.fetchall()
+            self.donor_users = set(donor[0] for donor in donors)
+            print(f"[DEBUG] Cargados {len(self.donor_users)} donadores desde la base de datos")
+        except Exception as e:
+            print(f"[DEBUG] Error al cargar donadores: {e}")
+        finally:
+            cursor.close()
+            connection.close()
+
 if __name__ == "__main__":
-    from config import TELEGRAM_TOKEN, VAULT_CHATID
+    from config import TELEGRAM_TOKEN, VAULT_CHATID, ADMIN_CHATID
     
     bot = MelodifyBot()
     bot.run(TELEGRAM_TOKEN)
