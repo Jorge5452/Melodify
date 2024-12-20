@@ -769,8 +769,9 @@ class MelodifyBot:
                             info['title'] = metadata['title']
                             info['artist'] = metadata['artist']
                             
-                            if cover_path:
-                                files_created.append(cover_path)
+                            # Eliminar esta parte ya que cover_path no existe aún
+                            # if cover_path:
+                            #     files_created.append(cover_path)
                 
                 # Continuar con el envío del archivo...
                 
@@ -778,60 +779,98 @@ class MelodifyBot:
                 print(f"[DEBUG] Error en el procesamiento de metadatos: {e}")
                 # Continuar con el envío del archivo sin metadatos
                 
-            # Enviar a la bóveda primero
-            print("[DEBUG] Enviando archivo a la bóveda")
-            if status_message and not is_playlist:
-                await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
-            
+            # Obtener la miniatura antes de enviar
+            thumb_path = None
+            if metadata and metadata.get('cover_url'):
+                try:
+                    # Descargar la miniatura
+                    thumb_path = f"{os.path.splitext(mp3_filename)[0]}_cover.jpg"
+                    response = requests.get(metadata['cover_url'])
+                    response.raise_for_status()
+                    with open(thumb_path, 'wb') as img_file:
+                        img_file.write(response.content)
+                    files_created.append(thumb_path)
+                except Exception as e:
+                    print(f"[DEBUG] Error al descargar miniatura: {e}")
+                    thumb_path = None
+
+            # Preparar el caption antes de enviar
             caption = (
                 f"🎵 {info['title']}\n"
                 f"👤 {info.get('artist', info.get('uploader', 'Unknown'))}\n"
                 f"youtube_id:{video_id}"
             )
-            
+
+            # Enviar a la bóveda con la miniatura
+            if status_message and not is_playlist:
+                await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
+
             try:
-                # Enviar a la bóveda con reintentos
-                vault_message = await self.send_large_audio(
-                    context,
-                    self.VAULT_CHAT_ID,
-                    mp3_filename,
-                    title=info['title'],
-                    performer=info.get('artist', info.get('uploader', 'Unknown')),
-                    duration=info.get('duration'),
-                    caption=caption
-                )
-                
-                print("[DEBUG] Guardando información en base de datos")
+                # Preparar el envío con la miniatura
+                with open(mp3_filename, 'rb') as audio_file:
+                    if thumb_path and os.path.exists(thumb_path):
+                        with open(thumb_path, 'rb') as thumb_file:
+                            vault_message = await context.bot.send_audio(
+                                chat_id=self.VAULT_CHAT_ID,
+                                audio=audio_file,
+                                title=info['title'],
+                                performer=info.get('artist', info.get('uploader', 'Unknown')),
+                                duration=info.get('duration'),
+                                caption=caption,
+                                thumbnail=thumb_file
+                            )
+                    else:
+                        vault_message = await context.bot.send_audio(
+                                chat_id=self.VAULT_CHAT_ID,
+                                audio=audio_file,
+                                title=info['title'],
+                                performer=info.get('artist', info.get('uploader', 'Unknown')),
+                                duration=info.get('duration'),
+                                caption=caption
+                            )
+
+                # Guardar en base de datos
                 await self.save_to_vault(
-                    video_id, 
-                    vault_message.audio.file_id, 
-                    info['title'], 
+                    video_id,
+                    vault_message.audio.file_id,
+                    info['title'],
                     info.get('artist', info.get('uploader', 'Unknown')),
-                    can_use_metadata  # Indica si esta versión tiene metadatos
+                    can_use_metadata
                 )
-                
+
                 # Enviar al usuario usando el mismo file_id
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
-                    audio=vault_message.audio.file_id,  # Usar file_id en lugar de reenviar archivo
+                    audio=vault_message.audio.file_id,
                     title=info['title'],
                     performer=info.get('artist', info.get('uploader', 'Unknown')),
                     duration=info.get('duration')
                 )
-                
+
             except TimedOut as e:
                 print(f"[DEBUG] Timeout al enviar archivo: {e}")
-                # Intentar enviar directamente al usuario si falló la bóveda
-                user_message = await self.send_large_audio(
-                    context,
-                    update.effective_chat.id,
-                    mp3_filename,
-                    title=info['title'],
-                    performer=info.get('artist', info.get('uploader', 'Unknown')),
-                    duration=info.get('duration')
-                )
-                raise e  # Re-lanzar para manejo superior
-                
+                # Intentar enviar directamente al usuario
+                with open(mp3_filename, 'rb') as audio_file:
+                    if thumb_path and os.path.exists(thumb_path):
+                        with open(thumb_path, 'rb') as thumb_file:
+                            await context.bot.send_audio(
+                                chat_id=update.effective_chat.id,
+                                audio=audio_file,
+                                title=info['title'],
+                                performer=info.get('artist', info.get('uploader', 'Unknown')),
+                                duration=info.get('duration'),
+                                thumbnail=thumb_file
+                            )
+                    else:
+                        await context.bot.send_audio(
+                                chat_id=update.effective_chat.id,
+                                audio=audio_file,
+                                title=info['title'],
+                                performer=info.get('artist', info.get('uploader', 'Unknown')),
+                                duration=info.get('duration')
+                            )
+                raise e
+
             if status_message and not is_playlist:
                 complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
                 # Programar eliminación del mensaje después de 10 segundos
@@ -1129,7 +1168,7 @@ class MelodifyBot:
         """
         Aplica los metadatos al archivo MP3 y retorna la ruta de la carátula si se descargó.
         Returns:
-            Optional[str]: Ruta del archivo de carátula o None si no hay carátula
+            Optional[str]: Ruta del archivo de car��tula o None si no hay carátula
         """
         try:
             print("\n=== INICIO DE APLICACIÓN DE METADATOS ===")
