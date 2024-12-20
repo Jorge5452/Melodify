@@ -19,7 +19,6 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON
 import requests
 from io import BytesIO
-from PIL import Image
 
 class MelodifyBot:
     def __init__(self):
@@ -130,6 +129,11 @@ class MelodifyBot:
         
         # Cargar donadores al iniciar
         asyncio.get_event_loop().run_until_complete(self.load_donors_from_db())
+
+        # Crear carpeta de descargas si no existe
+        self.DOWNLOADS_DIR = "downloads"
+        if not os.path.exists(self.DOWNLOADS_DIR):
+            os.makedirs(self.DOWNLOADS_DIR)
 
     def get_text(self, user_id: int, key: str) -> str:
         # Si el usuario no existe en user_settings, inicializarlo con valores por defecto
@@ -535,44 +539,58 @@ class MelodifyBot:
             if not is_playlist:
                 self.active_downloads[user_id] = False
 
-    async def search_in_vault(self, context: ContextTypes.DEFAULT_TYPE, video_id: str) -> Optional[str]:
-        """Busca una canción en la bóveda usando el video_id."""
+    async def search_in_vault(self, context: ContextTypes.DEFAULT_TYPE, video_id: str) -> Optional[dict]:
+        """Busca una canción en la bóveda y retorna la información completa."""
         connection = get_db_connection()
         if connection is None:
             return None
         
         try:
-            cursor = connection.cursor()
-            query = "SELECT file_id FROM vault WHERE video_id = %s"
+            cursor = connection.cursor(dictionary=True)
+            query = """
+            SELECT file_id, title, artist, has_metadata 
+            FROM vault 
+            WHERE video_id = %s
+            """
             cursor.execute(query, (video_id,))
             result = cursor.fetchone()
-            if result:
-                return result[0]  # Retorna file_id si se encuentra
+            return result
         except Exception as e:
-            print(f"Error buscando en bóveda: {e}")
+            print(f"[DEBUG] Error buscando en bóveda: {e}")
+            return None
         finally:
             cursor.close()
             connection.close()
-        
-        return None
-    
-    async def save_to_vault(self, video_id: str, file_id: str, title: str, artist: str):
-        """Guarda la canción en la bóveda usando MySQL."""
+
+    async def save_to_vault(self, video_id: str, file_id: str, title: str, artist: str, has_metadata: bool):
+        """Guarda o actualiza la canción en la bóveda, priorizando versiones con metadatos."""
         connection = get_db_connection()
         if connection is None:
             return
         
         try:
             cursor = connection.cursor()
-            query = """
-            INSERT INTO vault (video_id, file_id, title, artist)
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE file_id = %s
-            """
-            cursor.execute(query, (video_id, file_id, title, artist, file_id))
-            connection.commit()
+            # Verificar si existe una versión y sus metadatos
+            query = "SELECT has_metadata FROM vault WHERE video_id = %s"
+            cursor.execute(query, (video_id,))
+            existing = cursor.fetchone()
+            
+            if not existing or (not existing[0] and has_metadata):
+                # Si no existe o existe sin metadatos y estamos guardando con metadatos
+                query = """
+                INSERT INTO vault (video_id, file_id, title, artist, has_metadata)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                    file_id = VALUES(file_id),
+                    title = VALUES(title),
+                    artist = VALUES(artist),
+                    has_metadata = VALUES(has_metadata)
+                """
+                cursor.execute(query, (video_id, file_id, title, artist, has_metadata))
+                connection.commit()
+                print(f"[DEBUG] Canción {'actualizada' if existing else 'guardada'} en bóveda con metadatos: {has_metadata}")
         except Exception as e:
-            print(f"Error guardando en bóveda: {e}")
+            print(f"[DEBUG] Error guardando en bóveda: {e}")
         finally:
             cursor.close()
             connection.close()
@@ -617,53 +635,6 @@ class MelodifyBot:
                 print(f"[DEBUG] Error inesperado al enviar audio: {e}")
                 raise
 
-    def convert_thumbnail_to_jpg(self, thumb_path):
-        """Convierte una miniatura de WEBP a JPG"""
-        jpg_path = thumb_path.replace('.webp', '.jpg')
-        try:
-            with Image.open(thumb_path) as img:
-                img = img.convert("RGB")
-                img.save(jpg_path, "JPEG")
-            os.remove(thumb_path)
-            return jpg_path
-        except Exception as e:
-            print(f"[DEBUG] Error al convertir miniatura: {e}")
-            return None
-
-    def validate_thumbnail(self, info, title):
-        """Valida y obtiene la miniatura del video"""
-        possible_extensions = ['.webp', '.jpg', '.png']
-        
-        # Buscar miniatura existente
-        for ext in possible_extensions:
-            possible_path = f"{title}{ext}"
-            if os.path.exists(possible_path):
-                if ext == '.webp':
-                    return self.convert_thumbnail_to_jpg(possible_path)
-                return possible_path
-
-        # Si no se encuentra, intentar descargar de URL
-        thumbnails = info.get('thumbnails', [])
-        if thumbnails:
-            best_thumbnail = sorted(
-                thumbnails,
-                key=lambda x: (x.get('preference', 0), x.get('width', 0)),
-                reverse=True
-            )[0]
-            thumbnail_url = best_thumbnail.get('url')
-            if thumbnail_url:
-                manual_path = f"{title}_thumb.jpg"
-                try:
-                    response = requests.get(thumbnail_url)
-                    response.raise_for_status()
-                    with open(manual_path, 'wb') as f:
-                        f.write(response.content)
-                    return manual_path
-                except Exception as e:
-                    print(f"[DEBUG] Error al descargar miniatura: {e}")
-        
-        return None
-
     async def _handle_single_song(self, update: Update, context: ContextTypes.DEFAULT_TYPE, info: dict, ydl_opts: dict):
         user_id = update.effective_user.id
         files_created = []
@@ -671,17 +642,9 @@ class MelodifyBot:
         # Verificar si estamos procesando una playlist
         is_playlist = 'playlist_info' in context.user_data
         
-        # Verificar cache
-        cache_key = f"{info['id']}_{self.user_settings[user_id]['quality']}"
-        if cache_key in self.download_cache:
-            print("[DEBUG] Usando versión cacheada de la canción")
-            cached_file_id = self.download_cache[cache_key]
-            await context.bot.send_audio(
-                chat_id=update.effective_chat.id,
-                audio=cached_file_id
-            )
-            return
-
+        # Verificar si el usuario puede usar metadatos
+        can_use_metadata = self.user_settings[user_id].get('metadata', False) and await self.can_use_metadata(user_id)
+        
         print(f"[DEBUG] Iniciando _handle_single_song para usuario {user_id}")
         
         chat_id = update.effective_chat.id
@@ -698,57 +661,69 @@ class MelodifyBot:
             # Buscar en la bóveda usando MySQL
             video_id = info['id']
             print(f"[DEBUG] Buscando video_id {video_id} en la bóveda")
-            file_id = await self.search_in_vault(context, video_id)
+            vault_result = await self.search_in_vault(context, video_id)
             
-            if file_id:
-                print(f"[DEBUG] Canción encontrada en la bóveda con file_id: {file_id}")
-                try:
-                    if not is_playlist:
-                        await status_message.edit_text(self.get_text(user_id, "found_in_vault"))
-                    # Validar el file_id antes de usarlo
-                    file = await context.bot.get_file(file_id)
-                    await context.bot.send_audio(
-                        chat_id=chat_id,
-                        audio=file.file_id,
-                        title=info['title'],
-                        performer=info.get('artist', info.get('uploader', 'Unknown')),
-                        caption=f"🎵 {info['title']}"
-                    )
-                    if status_message is not None and not is_playlist:
-                        complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
-                        async def delete_complete_message():
-                            await asyncio.sleep(10)
-                            try:
-                                await complete_message.delete()
-                            except Exception as e:
-                                print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
-                        asyncio.create_task(delete_complete_message())
-                    print("[DEBUG] Canción enviada desde la bóveda exitosamente")
-                    self.download_cache[cache_key] = file.file_id
-                    return
-                except Exception as e:
-                    print(f"[DEBUG] Error al reenviar desde bóveda: {e}")
+            if vault_result:
+                print(f"[DEBUG] Canción encontrada en la bóveda con metadatos: {vault_result['has_metadata']}")
+                
+                # Si la versión en bóveda tiene metadatos o el usuario no puede usar metadatos,
+                # usar la versión de la bóveda
+                if vault_result['has_metadata'] or not can_use_metadata:
+                    try:
+                        if not is_playlist:
+                            await status_message.edit_text(self.get_text(user_id, "found_in_vault"))
+                        
+                        await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=vault_result['file_id'],
+                            title=vault_result['title'],
+                            performer=vault_result['artist'],
+                            caption=f"🎵 {vault_result['title']}"
+                        )
+                        
+                        if status_message and not is_playlist:
+                            complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                            async def delete_complete_message():
+                                await asyncio.sleep(10)
+                                try:
+                                    await complete_message.delete()
+                                except Exception as e:
+                                    print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
+                            asyncio.create_task(delete_complete_message())
+                        return
+                    except Exception as e:
+                        print(f"[DEBUG] Error al reenviar desde bóveda: {e}")
             
-            # Si no está en la bóveda o falló el reenvío, descargar
+            # Si llegamos aquí, necesitamos descargar la canción
             print("[DEBUG] Iniciando descarga de nueva canción")
-            if not is_playlist and status_message is not None:
+            if not is_playlist and status_message:
                 await status_message.edit_text(self.get_text(user_id, "downloading"))
             
             # Sanitizar el nombre del archivo
             safe_title = self.sanitize_filename(info['title'])
-            mp3_filename = f"{safe_title}.mp3"
+            mp3_filename = os.path.join(self.DOWNLOADS_DIR, f"{safe_title}.mp3")
+            files_created.extend([
+                mp3_filename,
+                os.path.join(self.DOWNLOADS_DIR, f"{safe_title}.webp"),
+                os.path.join(self.DOWNLOADS_DIR, f"{safe_title}.jpg")
+            ])
+            print(f"[DEBUG] Nombre sanitizado del archivo: {safe_title}")
             
-            # Configurar opciones de descarga
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'writethumbnail': True,
-                'outtmpl': f'{safe_title}.%(ext)s',
+                'outtmpl': os.path.join(self.DOWNLOADS_DIR, f'{safe_title}.%(ext)s'),
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': self.user_settings[user_id]["quality"],
+                }, {
+                    'key': 'FFmpegMetadata',
+                    'add_metadata': True,
+                }, {
+                    'key': 'EmbedThumbnail',
                 }],
-                'embedthumbnail': False,  # Importante: NO embeber la miniatura
+                'embedthumbnail': True,
                 'updatetime': False,
                 'ignoreerrors': True,
                 'no_warnings': True,
@@ -756,23 +731,24 @@ class MelodifyBot:
             }
             
             print("[DEBUG] Iniciando descarga con yt-dlp")
+            # Usar el nuevo método de descarga threaded
             try:
                 await self._download_with_retry(info['webpage_url'], ydl_opts)
             except Exception as e:
                 print(f"[DEBUG] Error después de reintentos: {e}")
                 raise
+            print("[DEBUG] Descarga completada con yt-dlp")
             
-            # Obtener y procesar la miniatura
-            thumb_path = self.validate_thumbnail(info, safe_title)
-            if thumb_path:
-                files_created.append(thumb_path)
+            # Preparar nombres de archivo
+            print(f"[DEBUG] Usando archivo MP3: {mp3_filename}")
             
             try:
                 metadata_enabled = self.user_settings[user_id].get('metadata', False)
                 
                 if metadata_enabled:
+                    # Verificar si puede usar metadatos
                     if not await self.can_use_metadata(user_id):
-                        metadata_message = await update.message.reply_text(self.get_text(user_id, "metadata_limit_reached"))
+                        metadata_message = await update.message.reply_text(self.get_text(user_id, "metadata_limit_reached"))                        
                         async def delete_metadata_message():
                             await asyncio.sleep(10)
                             try:
@@ -786,84 +762,98 @@ class MelodifyBot:
                         
                         if metadata:
                             print("[DEBUG] Aplicando metadatos al archivo")
-                            cover_path = await self.apply_metadata(mp3_filename, metadata)
-                            if cover_path:
-                                thumb_path = cover_path
-                                files_created.append(cover_path)
+                            await self.apply_metadata(mp3_filename, metadata)
                             await self.increment_metadata_usage(user_id)
                             
+                            # Actualizar la información para el envío
                             info['title'] = metadata['title']
                             info['artist'] = metadata['artist']
+                            
+                            if cover_path:
+                                files_created.append(cover_path)
                 
-                # Enviar a la bóveda primero
-                print("[DEBUG] Enviando archivo a la bóveda")
-                if status_message is not None and not is_playlist:
-                    await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
-                
-                # Preparar el envío del archivo
-                # Parámetros para la bóveda (incluye información completa)
-                vault_kwargs = {
-                    'chat_id': self.VAULT_CHAT_ID,
-                    'title': info['title'],
-                    'performer': info.get('artist', info.get('uploader', 'Unknown')),
-                    'duration': info.get('duration'),
-                    'caption': f"🎵 {info['title']}\n👤 {info.get('artist', info.get('uploader', 'Unknown'))}\nyoutube_id:{video_id}"
-                }
-                
-                # Parámetros para el usuario (sin información sensible)
-                user_kwargs = {
-                    'chat_id': update.effective_chat.id,
-                    'title': info['title'],
-                    'performer': info.get('artist', info.get('uploader', 'Unknown')),
-                    'duration': info.get('duration')
-                }
-                
-                # Si hay miniatura, agregarla como thumbnail para ambos
-                if thumb_path and os.path.exists(thumb_path):
-                    with open(thumb_path, 'rb') as thumb_file:
-                        thumbnail_data = thumb_file.read()
-                        vault_kwargs['thumbnail'] = thumbnail_data
-                        user_kwargs['thumbnail'] = thumbnail_data
-                
-                # Enviar a la bóveda
-                with open(mp3_filename, 'rb') as audio_file:
-                    vault_message = await context.bot.send_audio(
-                        audio=audio_file,
-                        **vault_kwargs
-                    )
-                
-                # Guardar en base de datos
-                await self.save_to_vault(
-                    video_id,
-                    vault_message.audio.file_id,
-                    info['title'],
-                    info.get('artist', info.get('uploader', 'Unknown'))
-                )
-                
-                # Enviar al usuario usando el mismo file_id pero con parámetros diferentes
-                await context.bot.send_audio(
-                    audio=vault_message.audio.file_id,
-                    **user_kwargs
-                )
-                
-                if status_message is not None and not is_playlist:
-                    complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
-                    async def delete_complete_message():
-                        await asyncio.sleep(10)
-                        try:
-                            await complete_message.delete()
-                        except Exception as e:
-                            print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
-                    asyncio.create_task(delete_complete_message())
+                # Continuar con el envío del archivo...
                 
             except Exception as e:
-                print(f"[DEBUG] Error al procesar/enviar archivo: {e}")
-                raise
+                print(f"[DEBUG] Error en el procesamiento de metadatos: {e}")
+                # Continuar con el envío del archivo sin metadatos
+                
+            # Enviar a la bóveda primero
+            print("[DEBUG] Enviando archivo a la bóveda")
+            if status_message and not is_playlist:
+                await status_message.edit_text(self.get_text(user_id, "saving_to_vault"))
+            
+            caption = (
+                f"🎵 {info['title']}\n"
+                f"👤 {info.get('artist', info.get('uploader', 'Unknown'))}\n"
+                f"youtube_id:{video_id}"
+            )
+            
+            try:
+                # Enviar a la bóveda con reintentos
+                vault_message = await self.send_large_audio(
+                    context,
+                    self.VAULT_CHAT_ID,
+                    mp3_filename,
+                    title=info['title'],
+                    performer=info.get('artist', info.get('uploader', 'Unknown')),
+                    duration=info.get('duration'),
+                    caption=caption
+                )
+                
+                print("[DEBUG] Guardando información en base de datos")
+                await self.save_to_vault(
+                    video_id, 
+                    vault_message.audio.file_id, 
+                    info['title'], 
+                    info.get('artist', info.get('uploader', 'Unknown')),
+                    can_use_metadata  # Indica si esta versión tiene metadatos
+                )
+                
+                # Enviar al usuario usando el mismo file_id
+                await context.bot.send_audio(
+                    chat_id=update.effective_chat.id,
+                    audio=vault_message.audio.file_id,  # Usar file_id en lugar de reenviar archivo
+                    title=info['title'],
+                    performer=info.get('artist', info.get('uploader', 'Unknown')),
+                    duration=info.get('duration')
+                )
+                
+            except TimedOut as e:
+                print(f"[DEBUG] Timeout al enviar archivo: {e}")
+                # Intentar enviar directamente al usuario si falló la bóveda
+                user_message = await self.send_large_audio(
+                    context,
+                    update.effective_chat.id,
+                    mp3_filename,
+                    title=info['title'],
+                    performer=info.get('artist', info.get('uploader', 'Unknown')),
+                    duration=info.get('duration')
+                )
+                raise e  # Re-lanzar para manejo superior
+                
+            if status_message and not is_playlist:
+                complete_message = await status_message.edit_text(self.get_text(user_id, "download_complete"))
+                # Programar eliminación del mensaje después de 10 segundos
+                async def delete_complete_message():
+                    await asyncio.sleep(10)
+                    try:
+                        await complete_message.delete()
+                    except Exception as e:
+                        print(f"[DEBUG] Error al eliminar mensaje de completado: {e}")
+                asyncio.create_task(delete_complete_message())
+            print("[DEBUG] Proceso completado exitosamente")
+            
+        except Exception as send_error:
+            print(f"[DEBUG] Error al enviar archivo: {send_error}")
+            if not isinstance(send_error, TimedOut):
+                raise send_error
             
         except Exception as e:
             print(f"[DEBUG] Error general en _handle_single_song: {e}")
-            if status_message is not None and not is_playlist:
-                error_message = await status_message.edit_text(self.get_text(user_id, "download_error").format(str(e)))
+            if status_message and not is_playlist:
+                error_message = await status_message.edit_text(
+                    self.get_text(user_id, "download_error").format(str(e)))
                 async def delete_error_message():
                     await asyncio.sleep(10)
                     try:
@@ -873,15 +863,30 @@ class MelodifyBot:
                 asyncio.create_task(delete_error_message())
         
         finally:
-            # Limpieza de archivos
-            files_created.extend([mp3_filename, f"{safe_title}.webp", f"{safe_title}.jpg"])
-            for file in files_created:
-                if os.path.exists(file):
-                    try:
-                        os.remove(file)
-                        print(f"[DEBUG] Archivo eliminado: {file}")
-                    except Exception as e:
-                        print(f"[DEBUG] Error al eliminar {file}: {e}")
+            # Solo realizar limpieza si se crearon archivos
+            if files_created:
+                try:
+                    print("[DEBUG] Iniciando limpieza de archivos descargados")
+                    await asyncio.sleep(1)
+                    
+                    # Buscar también archivos que terminen en _cover.jpg
+                    base_name = os.path.splitext(os.path.basename(safe_title))[0]
+                    additional_files = [
+                        os.path.join(self.DOWNLOADS_DIR, f)
+                        for f in os.listdir(self.DOWNLOADS_DIR)
+                        if f.startswith(base_name) and (f.endswith('_cover.jpg') or f.endswith('_cover.jpeg'))
+                    ]
+                    files_created.extend(additional_files)
+                    
+                    for file in files_created:
+                        if os.path.exists(file):
+                            try:
+                                os.remove(file)
+                                print(f"[DEBUG] Archivo eliminado: {file}")
+                            except Exception as e:
+                                print(f"[DEBUG] Error al eliminar {file}: {e}")
+                except Exception as e:
+                    print(f"[DEBUG] Error durante la limpieza: {e}")
 
     async def _handle_playlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE, info: dict, ydl_opts: dict):
         BATCH_SIZE = 5  # Procesar 5 canciones simultáneamente
@@ -996,6 +1001,51 @@ class MelodifyBot:
                 if result.get('recording-list'):
                     print("[DEBUG] ✅ Resultados encontrados con el segundo filtro")
                     return await self._process_results(result, clean_title, clean_artist)
+
+            # NUEVO FILTRO: Búsqueda por título y álbum
+            print("\n[DEBUG] === INICIANDO FILTRO POR TÍTULO Y ÁLBUM ===")
+            # Intentar obtener el nombre del álbum de los metadatos
+            album = None
+            if 'album' in info:
+                album = info['album']
+            elif 'playlist_title' in info:  # A veces el playlist_title es el álbum
+                album = info['playlist_title']
+            
+            if album:
+                # Limpiar nombre del álbum
+                print(f"[DEBUG] Álbum original: {album}")                
+                clean_album = re.sub(r'\(.*?\)|\[.*?\]|(?:Album|Complete|Full|OST|(?:\bEP\b)|(?:\bLP\b))', '', album, flags=re.IGNORECASE).strip()
+                print(f"[DEBUG] Álbum detectado: {clean_album}")
+                
+                # Construir query con título y álbum
+                query = f'recording:"{clean_title}" AND release:"{clean_album}"'
+                print(f"[DEBUG] Búsqueda por título y álbum: {query}")
+                result = musicbrainzngs.search_recordings(query=query, limit=5)
+                
+                if result.get('recording-list'):
+                    print(f"[DEBUG] ✅ Resultados encontrados con álbum: {clean_album}")
+                    # Mostrar detalles del resultado encontrado
+                    recording = result['recording-list'][0]
+                    if 'release-list' in recording:
+                        print(f"[DEBUG] Álbum encontrado: {recording['release-list'][0]['title']}")
+                    return await self._process_results(result, clean_title, None)
+                
+                # Si no hay resultados, intentar una búsqueda más flexible
+                print("[DEBUG] Intentando búsqueda flexible con álbum...")
+                # Tomar solo la primera palabra del álbum para una búsqueda más amplia
+                album_words = clean_album.split()
+                if album_words:
+                    first_album_word = album_words[0]
+                    query = f'recording:"{clean_title}" AND release:"{first_album_word}"'
+                    print(f"[DEBUG] Búsqueda flexible por título y álbum: {query}")
+                    result = musicbrainzngs.search_recordings(query=query, limit=5)
+                    
+                    if result.get('recording-list'):
+                        print(f"[DEBUG] ✅ Resultados encontrados con búsqueda flexible de álbum")
+                        recording = result['recording-list'][0]
+                        if 'release-list' in recording:
+                            print(f"[DEBUG] Álbum encontrado: {recording['release-list'][0]['title']}")
+                        return await self._process_results(result, clean_title, None)
 
             # 4. TERCER FILTRO: Búsqueda solo por título
             print("\n[DEBUG] === INICIANDO TERCER FILTRO: SOLO TÍTULO ===")
