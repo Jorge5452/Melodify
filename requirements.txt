@@ -1,34 +1,25 @@
-python-telegram-bot==20.6
-yt-dlp==2023.11.16
-ffmpeg-python==0.2.0
-aiofiles==23.2.1
-tenacity==8.2.2
-musicbrainzngs>=0.7.1
-mutagen>=1.45.1
+aiofiles==24.1.0
+anyio==4.8.0
+cachetools==5.5.1
+certifi==2025.1.31
+charset-normalizer==3.4.1
+h11==0.14.0
+httpcore==1.0.7
+httpx==0.28.1
+idna==3.10
+musicbrainzngs==0.7.1
+mutagen==1.47.0
+mysql-connector-python==9.2.0
+python-telegram-bot==21.10
+tenacity==9.0.0
+typing_extensions==4.12.2
+urllib3==2.3.0
+websockets==14.2
+yt-dlp==2025.1.26
 
 
-- [GENERAL] Arreglar boton de volver                                                                                                check
-- [GENERAL] Boton de descargar musica                                                                                               check                          
-- [GENERAL] Que si encuentra una cancion en la boveda no haga limpieza de archivos                                                  check
-- [GENERAL] Manejo de links                                                                                                         check
-- [GENERAL] Que no sea necesario el /start para usar el bot una vez iniciado si se llega a reiniciar el bot                         check
-- [GENERAL] Habilitar un menu el bot donde se muestren los comandos disponibles                                                     check
-- [GENERAL] Que borre los mensajes de "Descargando..." y "Descarga completada" despues de un tiempo                                 check
-- [METADATOS] Agregar un cuarto filtro de busqueda de metadatos (convirtiendo este filtro en el tercero y desplazando los demas)    check
-- [METADATOS] Opcion de donador para editar metadatos (350 usos gratis)                                                             check
-- [METADATOS] Agregar limpieza a las fotos de los albumes                                                                           check
-- [METADATOS] Cambiar a que siempre esten activos                                                                                   check  
-                          y
-- [METADATOS] Implementar lo que te dijo chatgpt ayer                                                                               check
 
 
-- [METADATOS Y PARA PENSAR] Que se pregunte al usuario cual seleccionar o usar datos basicos
-- [METADATOS] Al parecer, cuando se hace una busqueda con el tercer filtro, vuelve a hacer otra busqueda                                                             
-- [METADATOS] Bug, cuando ningun filtro encuentra algo, sigue marcando "Canción guardada en bóveda con metadatos: True"
-              Y en base de datos marca como "1"
 
 
-- [MEJORA] Que en telegram salga la miniatura de la cancion 
-- [MEJORA] MODO INLINE
-- [ZIP] Opcion de archivo zip
 
