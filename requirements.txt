@@ -16,6 +16,7 @@ typing_extensions==4.12.2
 urllib3==2.3.0
 websockets==14.2
 yt-dlp==2025.1.26
+requests==2.32.3
 
 
 
